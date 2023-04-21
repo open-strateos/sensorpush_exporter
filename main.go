@@ -14,7 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-//Command-line Flags
+// Command-line Flags
 var port = flag.Int("port", 9687, "Port to publish metrics on.")
 var pollingInterval = flag.Int("interval", 60, "Polling interval, in seconds.")
 var sensorNameRefreshInterval = flag.Int("name-refresh-interval", 5*60, "How frequently to automatically refresh the sensor names table, in seconds")
@@ -28,6 +28,7 @@ const promSubsystemName = "sensorpush_exporter" // For labelling prometheus metr
 var startTime = time.Now()
 var globalAuthCtx *context.Context // holds auth token for sensorpush
 
+var gatewayNameMap map[string]string     // maps gateway IDs to display names
 var sensorNameMap map[string]string      // maps sensor IDs to display names
 var sensorNamesRefresh = make(chan bool) // send to this channel to force-refresh the sensor names
 var sensorNamesReady = make(chan bool)   // signal that sensor names are ready after a forced refresh
@@ -38,6 +39,7 @@ var temperatureGaugeVec *prometheus.GaugeVec
 var humidityGaugeVec *prometheus.GaugeVec
 var reauthCounter prometheus.Counter
 var numberOfSensors prometheus.Gauge
+var secondsSinceLastSeenGauge *prometheus.GaugeVec
 
 func initMetrics(ctx context.Context) {
 	uptimeGauge = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -77,6 +79,14 @@ func initMetrics(ctx context.Context) {
 		Help:      "Relative humidity at the sensor.",
 	}, labelNames)
 	prometheus.MustRegister(humidityGaugeVec)
+
+	gatewayLabelNames := []string{"gateway_name"}
+	secondsSinceLastSeenGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: promSubsystemName,
+		Name:      "seconds_since_last_seen",
+		Help:      "Time in seconds since the gateway was last seen",
+	}, gatewayLabelNames)
+	prometheus.MustRegister(secondsSinceLastSeenGauge)
 }
 
 func watchUptime(ctx context.Context) {
@@ -185,7 +195,7 @@ func getSamples(authCtx *context.Context, client *sensorpush.APIClient, sensorNa
 		Limit: 1,
 	})
 	if err != nil {
-		log.Printf("Error from sensorpush, response code %d", resp.StatusCode)
+		log.Printf("Error from sensorpush when fetching samples, response code %d", resp.StatusCode)
 		return nil, err
 	}
 
@@ -205,12 +215,21 @@ func getSamples(authCtx *context.Context, client *sensorpush.APIClient, sensorNa
 
 }
 
+func getGateways(authCtx *context.Context, client *sensorpush.APIClient) (map[string]sensorpush.Gateway, error) {
+	gateways, resp, err := client.ApiApi.Gateways(*authCtx, sensorpush.GatewaysRequest{})
+	if err != nil {
+		log.Printf("Error from sensorpush when fetching gateways, response code %d", resp.StatusCode)
+		return nil, err
+	}
+	return gateways, nil
+}
+
 func fahrenheitToCelcius(tempF float32) float64 {
 	return float64(tempF-32) / 1.8
 }
 
 // Update prometheus metrics
-func updateMetrics(samples map[string]sensorpush.Sample) {
+func updateMetrics(samples map[string]sensorpush.Sample, gateways map[string]sensorpush.Gateway) {
 	for sensorName, sample := range samples {
 		labels := prometheus.Labels{
 			"device_name": sensorName,
@@ -222,6 +241,16 @@ func updateMetrics(samples map[string]sensorpush.Sample) {
 		humidityGaugeVec.With(labels).Set(humidityPct)
 
 		log.Printf("device_name: %s\ttemp: %fC\thumidity: %f%%", sensorName, temperatureCelcius, humidityPct)
+	}
+
+	for gatewayName, gateway := range gateways {
+		labels := prometheus.Labels{
+			"gateway_name": gatewayName,
+		}
+		secondsSinceLastSeen := time.Now().Unix() - gateway.LastSeen.Unix()
+		secondsSinceLastSeenGauge.With(labels).Set(float64(secondsSinceLastSeen))
+
+		log.Printf("gateway_name: %s\tseconds_since_last_seen: %d", gatewayName, secondsSinceLastSeen)
 	}
 }
 
@@ -259,7 +288,14 @@ func main() {
 			authenticateGlobal(client, username, password)
 			continue
 		}
-		updateMetrics(samples)
+		gateways, err := getGateways(globalAuthCtx, client)
+		if err != nil {
+			log.Print("Failed to fetch gateways: ", err)
+			log.Print("Reauthenticating...")
+			authenticateGlobal(client, username, password)
+			continue
+		}
+		updateMetrics(samples, gateways)
 
 		time.Sleep(time.Duration(*pollingInterval) * time.Second)
 	}

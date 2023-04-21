@@ -9,9 +9,11 @@
  */
 
 package sensorpush
+
 import (
 	"time"
 )
+
 // Gateway struct for Gateway
 type Gateway struct {
 	// Date last alert was sent
@@ -23,7 +25,7 @@ type Gateway struct {
 	// Name associated with a gateway
 	Name string `json:"name,omitempty"`
 	// Gateway is paired with a bluetooth device
-	Paired string `json:"paired,omitempty"`
+	Paired bool `json:"paired,omitempty"`
 	// Samples associated with SensorPush gateway
 	Samples map[string]Sample `json:"samples,omitempty"`
 	// Version of Sensorpush software
